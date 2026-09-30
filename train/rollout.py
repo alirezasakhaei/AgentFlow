@@ -6,7 +6,7 @@ from typing import Any, Optional
 
 import sympy
 
-from autogen_ext.tools.mcp import StdioServerParams
+# PATCHED (MAReasoning) 2026-09-23: unused import removed; autogen_ext.tools.mcp breaks with current mcp.
 from agentflow import Trainer, LitAgent, NamedResources, LLM, reward, configure_logger, DevTaskLoader
 
 from agentflow.solver import construct_solver
@@ -21,7 +21,7 @@ configure_logger()
 
 
 @reward
-async def eval(question: str, groundtruth: any, answer_extracted: any, val: bool = False) -> float:
+async def eval(question: str, groundtruth: any, answer_extracted: any, val: bool = False, source: str = None) -> float:  # PATCHED (MAReasoning): source-aware rule-based reward
     """
     Evaluates if the extracted answer is correct by calling an LLM judge (gpt-4o).
     It strip(), and matches the final answer.
@@ -30,7 +30,7 @@ async def eval(question: str, groundtruth: any, answer_extracted: any, val: bool
     groundtruth_str = str(groundtruth)
     answer_extracted_str = str(answer_extracted)
 
-    is_correct = compute_score(question_str, groundtruth_str, answer_extracted_str)
+    is_correct = compute_score(question_str, groundtruth_str, answer_extracted_str, source)  # PATCHED (MAReasoning)
     
     return 1.0 if is_correct else 0.0
 
@@ -200,7 +200,7 @@ class Rollout(LitAgent):
             answer = "None"
 
         # Evaluate the answer against the ground truth
-        reward_value = await eval(task["question"], str(task["result"]), answer, val)  # reward is tracked with the decorator
+        reward_value = await eval(task["question"], str(task["result"]), answer, val, source=task.get("source"))  # PATCHED (MAReasoning)  # reward is tracked with the decorator
         print("answer: {} ground_truth: {} reward: {}".format(answer, task["result"], reward_value))
 
         idx = task.get("extra_info", {}).get("idx", "unknown_idx")
@@ -234,8 +234,11 @@ class Rollout(LitAgent):
             len([f for f in files if f.endswith(".json")])
             for root, dirs, files in os.walk(idx_dir)
         )
-        assert json_count < self.rollout_num, \
-            f"Too many rollouts for idx {idx}: already {json_count} >= {self.rollout_num}"
+        # PATCHED (MAReasoning) 2026-09-23: the daemon re-queues rollouts whose triplets came back
+        # empty, so a retried idx legitimately exceeds rollout_n files. Warn instead of raising:
+        # the assertion turned every retry into an empty rollout.
+        if json_count >= self.rollout_num:
+            print(f"Warning: more rollouts than rollout_n for idx {idx}: {json_count} >= {self.rollout_num} (retry?)")
 
         save_path = os.path.join(idx_dir, filename)
 
@@ -384,7 +387,7 @@ if __name__ == "__main__":
         "AGENT_MAX_TIMEOUT"
     ]
 
-    config_file = 'train/config.yaml'
+    config_file = os.environ.get('AGENTFLOW_TRAIN_CONFIG', 'train/config.yaml')  # PATCHED (MAReasoning)
 
     values = get_values_from_yaml(config_file, keys_to_retrieve)
 
@@ -408,6 +411,8 @@ if __name__ == "__main__":
     config_dict = dict(zip(config_keys_map.values(), values))
 
     port_to_use = config_dict.get("port")
+    if os.environ.get("AGENTFLOW_SKIP_PORT_CLEANUP") == "1":  # PATCHED (MAReasoning): worker restart must not kill the trainer on :9999
+        port_to_use = None
     if port_to_use:
         print(f"[INFO] Checking and freeing port {port_to_use}...")
         kill_process_on_port(port_to_use)

@@ -203,7 +203,11 @@ execution = tool.execute(query=["Methanol", "function of hyperbola", "Fermat's L
 
         def split_commands(command: str) -> List[str]:
             # Use regex to find all tool.execute() commands and their surrounding code
-            pattern = r'.*?execution\s*=\s*tool\.execute\([^\n]*\)\s*(?:\n|$)'
+            # PATCHED (MAReasoning): was r'.*?execution\s*=\s*...', which required the
+            # binding to be named exactly `execution`. Planners routinely emit
+            # `execution_a = tool.execute(...)` / two calls in one step; those matched
+            # nothing and the step silently returned []. Accept any identifier.
+            pattern = r'.*?\w+\s*=\s*tool\.execute\([^\n]*\)\s*(?:\n|$)'
             blocks = re.findall(pattern, command, re.DOTALL)
             return [block.strip() for block in blocks if block.strip()]
 
@@ -223,8 +227,20 @@ execution = tool.execute(query=["Methanol", "function of hyperbola", "Fermat's L
                 try:
                     # Inject cancel_event into the execution context for cooperative cancellation
                     local_context['_cancel_event'] = cancel_event
+                    before = set(local_context)
                     exec(block, globals(), local_context)
-                    result_container['result'] = local_context.get('execution')
+                    # PATCHED (MAReasoning): the binding is no longer guaranteed to be
+                    # called `execution`, so fall back to the last new non-reserved name
+                    # introduced by the block.
+                    res = local_context.get('execution')
+                    if res is None:
+                        reserved = {'tool', '_cancel_event', '__builtins__'}
+                        new_names = [k for k in local_context
+                                     if k not in before and k not in reserved
+                                     and not k.startswith('__')]
+                        if new_names:
+                            res = local_context[new_names[-1]]
+                    result_container['result'] = res
                     result_container['completed'] = True
                 except Exception as e:
                     result_container['exception'] = e

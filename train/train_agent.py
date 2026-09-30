@@ -10,7 +10,7 @@ def main():
     and run the training script.
     """
     # Define the path to the YAML configuration file
-    config_file_path = "train/config.yaml"
+    config_file_path = os.environ.get("AGENTFLOW_TRAIN_CONFIG", "train/config.yaml")  # PATCHED (MAReasoning)
 
     # --- Parse YAML configuration ---
     print("Parsing YAML configuration from 'train/config.yaml'...")

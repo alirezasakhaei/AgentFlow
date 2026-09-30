@@ -1,0 +1,14 @@
+.git
+.venv
+.venv-train
+**/__pycache__
+rollout_data
+solver_cache
+outputs
+test/*/results
+test/*/cache
+*.log
+wandb
+agentops.log
+data/train/*.parquet
+data/val/*.parquet

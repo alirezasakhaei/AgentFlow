@@ -127,6 +127,9 @@ def main(output_dir='./data/train'):
         return
 
     print("\n--- 3. Concatenating datasets ---")
+    # PATCHED (MAReasoning) 2026-09-23: datasets>=3 refuses to concatenate string vs large_string
+    # columns; cast the math split onto the NQ schema first.
+    processed_math = processed_math.cast(processed_nq.features)
     combined_dataset = concatenate_datasets([processed_nq, processed_math])
     
     # Add a shuffle step here

@@ -220,3 +220,8 @@ marimo/_static/
 marimo/_lsp/
 __marimo__/
 deployment/
+solver_cache/
+test/*/results/
+test/*/cache/
+.venv-train/
+agentops.log

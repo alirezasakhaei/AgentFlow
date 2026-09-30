@@ -140,6 +140,17 @@ Be biref and precise with insight.
                 # Join the parts with a single underscore and convert to lowercase
                 return "_".join(part.lower() for part in parts)
 
+            # PATCHED (MAReasoning): strip markdown decoration before matching. Planners
+            # commonly emit the tool name as a bullet ("- Wikipedia_RAG_Search_Tool") or in
+            # backticks; to_canonical() split the bullet into its own token, so the name
+            # never matched any tool and the step was discarded as "No matched tool given".
+            # On the 72B arm that cost 45 of 207 steps (22%) whose tool choice was correct.
+            # Only decoration is removed: a genuinely wrong name (Google Search,
+            # IMDb_Search_Tool) still fails to match, as it should.
+            if tool_name and tool_name.strip():
+                tool_name = tool_name.strip().splitlines()[0]
+                tool_name = tool_name.strip(" \t`*\"'.:-[]()")
+
             normalized_input = to_canonical(tool_name)
             
             for tool in self.available_tools:

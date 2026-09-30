@@ -1,0 +1,103 @@
+# PATCHED (MAReasoning) 2026-09-30 -- EXPERIMENT 3: Flow-GRPO, Qwen3-8B, lr 3e-6 + overlong penalty + prompt cap 8192.
+# Derived from config_mds.yaml (experiment 2, lr 1e-5) after that run collapsed into repetition loops at step ~47:
+#   lr 1e-5 -> 3e-6                     (1e-6 moved nothing in 100 steps; 1e-5 collapsed by step 47)
+#   AGENTFLOW_MAX_RESPONSE_TOKENS 2048  (agentflow/runner.py: a planner turn that fills the response budget zeroes the rollout reward)
+#   max_prompt_length 6144 -> 8192      (exp 2 dropped 14-151 planner turns per step for exceeding 6144; observed max prompt 6138)
+env:
+  CUDA_VISIBLE_DEVICES: '0,1'
+  HYDRA_FULL_ERROR: 1
+  N_GPUS: 2
+  BASE_MODEL: 'Qwen/Qwen3-8B'
+  HELPER_MODEL: 'vllm-Qwen/Qwen3-8B-helper'
+  VLLM_BASE_URL: 'http://mds1srv2.epfl.ch:8000/v1'   # frozen helpers + tool engines (mds2)
+  VLLM_API_KEY: 'dummy-token'
+  AGENTFLOW_DISABLE_THINKING: '1'
+  AGENTFLOW_MAX_RESPONSE_TOKENS: '2048'   # exp 3: overlong penalty (agentflow/runner.py), must equal data.max_response_length
+  REWARD_MODE: 'judge'            # judge = Qwen3-30B-A3B on mds2:8001 (train/judge.py), rule = train/utils.py only
+  JUDGE_URL: 'http://mds1srv2.epfl.ch:8001/v1/chat/completions'
+  JUDGE_MODEL: 'Qwen/Qwen3-30B-A3B-judge'
+  HF_HOME: '/data/sakhaei/hf'
+  WANDB_MODE: 'offline'          # local wandb runs only, synced by hand if ever
+  WANDB_DIR: '/data/sakhaei/runs/wandb'
+  ROLLOUT_TP_SIZE: 1
+  EXPERIMENT_NAME: 'flowgrpo_qwen3_8b_judge_lr3e6_pen'
+  PROJECT_NAME: 'AgentFlow_mds'
+  BASE_DATA_DIR: 'data'
+  VERBOSITY: 'INFO'
+  N_WORKERS: 32   # rollout-bound at 16 (16 rollouts ~ 88 s); helpers on the H100 take the concurrency
+  ENABLE_TOOLS: ["Base_Generator_Tool","Python_Coder_Tool","Wikipedia_Search_Tool"]
+  TOOL_ENGINE: ["vllm-Qwen/Qwen3-8B-helper","vllm-Qwen/Qwen3-8B-helper","vllm-Qwen/Qwen3-8B-helper"]
+  MODEL_ENGINE: ["trainable","vllm-Qwen/Qwen3-8B-helper","vllm-Qwen/Qwen3-8B-helper","vllm-Qwen/Qwen3-8B-helper"]
+  TOOL_STEPS: 3
+  TEST_TEMPERATURE: 0.0
+  TRAIN_TEMPERATURE: 0.7
+  OUTPUT_TYPE: "direct"
+  AGENT_MAX_TIMEOUT: 500
+
+python_args:
+  agentflow.port: 9999
+  algorithm.adv_estimator: 'grpo'
+  data.train_files: '${BASE_DATA_DIR}/train/combined_train.parquet'
+  data.val_files: '${BASE_DATA_DIR}/val/aime24.parquet'
+  actor_rollout_ref.rollout.tensor_model_parallel_size: '${ROLLOUT_TP_SIZE}'
+  trainer.n_gpus_per_node: '${N_GPUS}'
+  data.train_batch_size: 32
+  actor_rollout_ref.rollout.n: 8
+  actor_rollout_ref.actor.ppo_mini_batch_size: 8
+  actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu: 1
+  actor_rollout_ref.actor.use_dynamic_bsz: True
+  actor_rollout_ref.actor.ppo_max_token_len_per_gpu: 16384   # >= prompt+response. Under FSDP2 CPU offload every micro-batch streams the
+                                                              # whole model, so fewer, larger micro-batches = faster updates (8192: 26 min/update, peak 50 GB)
+  actor_rollout_ref.rollout.log_prob_max_token_len_per_gpu: 16384
+  actor_rollout_ref.ref.log_prob_max_token_len_per_gpu: 16384
+  actor_rollout_ref.actor.entropy_from_logits_with_chunking: True
+  actor_rollout_ref.ref.entropy_from_logits_with_chunking: True
+  actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu: 2
+  actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu: 2
+  actor_rollout_ref.rollout.multi_turn.format: 'hermes'
+  actor_rollout_ref.model.path: '${BASE_MODEL}'
+  data.max_prompt_length: 8192    # exp 3: 6144 dropped up to 25% of planner turns per step (the long late turns). TRAINING cap only (longer turns are dropped from the batch, see n_dropped_sample_because_of_prompt);
+                                  # generation keeps a 12288 context. 10240 (+2048) OOMed the actor update twice: a 12K-token micro-batch
+                                  # plus fp32 logits over a 152K vocab does not fit beside the sleeping vLLM engine.
+  data.max_response_length: 2048
+  data.truncation: 'truncate'
+  actor_rollout_ref.rollout.max_model_len: 12288
+  actor_rollout_ref.rollout.max_num_batched_tokens: 8192
+  # vLLM 0.9.2 generation faulted with an illegal memory access mid-decode in step 1 (2026-09-23 19:10);
+  # prompts run close to max_model_len and 48 workers oversubscribed each replica's KV cache (preemption
+  # + prefix caching is a known trouble spot in that version). Disable prefix caching, chunk prefill
+  # below max_model_len, cap concurrent sequences per replica.
+  +actor_rollout_ref.rollout.enable_prefix_caching: False   # + = Hydra add; verl 0.5 has no such key, the venv patch reads it
+  actor_rollout_ref.rollout.max_num_seqs: 32
+  trainer.val_before_train: True
+  actor_rollout_ref.actor.optim.lr: 3e-6   # exp 3 (2026-09-30): 1e-6 moved nothing in 100 steps, 1e-5 collapsed at step ~47
+  actor_rollout_ref.model.use_remove_padding: True
+  actor_rollout_ref.actor.use_kl_loss: True
+  actor_rollout_ref.actor.kl_loss_coef: 0.001
+  actor_rollout_ref.actor.entropy_coeff: 0.0
+  actor_rollout_ref.actor.clip_ratio_low: 0.2
+  actor_rollout_ref.actor.clip_ratio_high: 0.3
+  actor_rollout_ref.model.enable_gradient_checkpointing: True
+  # 2026-09-24: FSDP1 with param/optimizer offload still puts params fp32 + grads fp32 + Adam m,v (~64 GB/GPU)
+  # on the card for the whole update; runs OOMed at steps 21-22. FSDP2 with a CPU offload policy keeps
+  # them on host memory (503 GB) and streams one layer at a time.
+  actor_rollout_ref.actor.strategy: fsdp2
+  actor_rollout_ref.actor.fsdp_config.offload_policy: True
+  actor_rollout_ref.actor.fsdp_config.param_offload: False
+  actor_rollout_ref.model.enable_activation_offload: True
+  actor_rollout_ref.actor.fsdp_config.optimizer_offload: False
+  actor_rollout_ref.ref.fsdp_config.param_offload: True
+  actor_rollout_ref.rollout.name: 'vllm'
+  actor_rollout_ref.rollout.gpu_memory_utilization: 0.4
+  algorithm.use_kl_in_reward: False
+  trainer.critic_warmup: 0
+  trainer.logger: ['console','wandb']
+  trainer.project_name: '${PROJECT_NAME}'
+  trainer.experiment_name: '${EXPERIMENT_NAME}'
+  trainer.nnodes: 1
+  trainer.save_freq: 5    # 2026-09-29: crashes cost up to save_freq steps; 92 GB per ckpt, keep 3
+  trainer.max_actor_ckpt_to_keep: 3   # each verl ckpt is 92 GB (optimizer states); merged HF copies are kept separately
+  trainer.test_freq: 10
+  trainer.total_epochs: 1
+  trainer.total_training_steps: 100
+  trainer.default_local_dir: '/data/sakhaei/ckpt/${PROJECT_NAME}/${EXPERIMENT_NAME}'

@@ -129,12 +129,14 @@ def create_llm_engine(model_string: str, use_cache: bool = False, is_multimodal:
         model_string = model_string.replace("vllm-", "")
         config = {
             "model_string": model_string,
-            "base_url": kwargs.get("base_url", "http://localhost:8000/v1"), # TODO: check the RL training initialized port and name
+            # PATCHED (MAReasoning): honour VLLM_BASE_URL when no explicit base_url is given,
+            # so non-planner components (verifier/executor/tools) can hit a second vLLM server.
+            "base_url": kwargs.get("base_url") or os.environ.get("VLLM_BASE_URL", "http://localhost:8000/v1"),
             "use_cache": use_cache,
             "is_multimodal": is_multimodal,
             "temperature": kwargs.get("temperature", 0.7),
             "top_p": kwargs.get("top_p", 0.9),
-            "frequency_penalty": kwargs.get("frequency_penalty", 1.2),
+            "frequency_penalty": kwargs.get("frequency_penalty", 0.0),  # PATCHED (MAReasoning): 1.2 drives 7B models off-distribution (CJK drift, boxed-spam).
             "max_model_len": kwargs.get("max_model_len", 15200),
             "max_seq_len_to_capture": kwargs.get("max_seq_len_to_capture", 15200),
         }

@@ -10,6 +10,18 @@ from agentflow.engine.factory import create_llm_engine
 
 load_dotenv()
 
+# PATCHED (MAReasoning): process-local embedder, loaded once on first use and kept on
+# CPU. Replaces the paid OpenAI embeddings path in _embed_strings below.
+_LOCAL_EMBEDDER = None
+_LOCAL_EMBEDDER_NAME = "BAAI/bge-small-en-v1.5"
+
+def _get_local_embedder():
+    global _LOCAL_EMBEDDER
+    if _LOCAL_EMBEDDER is None:
+        from sentence_transformers import SentenceTransformer
+        _LOCAL_EMBEDDER = SentenceTransformer(_LOCAL_EMBEDDER_NAME, device="cpu")
+    return _LOCAL_EMBEDDER
+
 # Tool name mapping - this defines the external name for this tool
 TOOL_NAME = "Web_RAG_Search_Tool"
 
@@ -180,20 +192,22 @@ class Web_Search_Tool(BaseTool):
 
     def _embed_strings(self, strings):
         """
-        Embed the strings using OpenAI's embedding model.
-        Parameters:
-            strings (list): A list of strings to embed.
-        Returns:
-            list: A list of embeddings.
+        Embed the strings with a local sentence-transformers encoder.
+
+        PATCHED (MAReasoning): upstream called OpenAI's embeddings API, which needs a paid
+        key and so made every Wikipedia/Web-RAG retrieval a paid call. Replaced with
+        BAAI/bge-small-en-v1.5 (33M params, 384-dim) pinned to CPU so it never competes
+        with the two vLLM servers for GPU memory. Deterministic, free, ~0.2s per 24 chunks.
         """
         try:
-            client = openai.OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
-            embeddings = client.embeddings.create(
-                input=strings,
-                model=self.embeddings_model
+            model = _get_local_embedder()
+            res = model.encode(
+                strings,
+                normalize_embeddings=True,
+                batch_size=16,
+                show_progress_bar=False,
             )
-            res = [embedding.embedding for embedding in embeddings.data]
-            return res
+            return [list(map(float, v)) for v in res]
         except Exception as e:
             raise Exception(f"Error embedding strings: {str(e)}")
 

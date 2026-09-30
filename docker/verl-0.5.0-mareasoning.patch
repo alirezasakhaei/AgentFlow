@@ -1,0 +1,37 @@
+--- a/verl/workers/rollout/vllm_rollout/vllm_async_server.py
++++ b/verl/workers/rollout/vllm_rollout/vllm_async_server.py
+@@ -257,7 +257,7 @@
+             disable_log_stats=config.disable_log_stats,
+             max_num_batched_tokens=max_num_batched_tokens,
+             enable_chunked_prefill=config.enable_chunked_prefill,
+-            enable_prefix_caching=True,
++            enable_prefix_caching=config.get("enable_prefix_caching", True),  # PATCHED (MAReasoning) 2026-09-24: was hard-coded True; set via +actor_rollout_ref.rollout.enable_prefix_caching
+             trust_remote_code=trust_remote_code,
+             seed=config.get("seed", 0),
+         )
+--- a/verl/utils/checkpoint/fsdp_checkpoint_manager.py
++++ b/verl/utils/checkpoint/fsdp_checkpoint_manager.py
+@@ -142,7 +142,11 @@
+                 remote_optim_path = os.path.join(local_path, f"optim_world_size_{self.world_size}_rank_{self.rank}.pt")
+                 local_optim_path = copy_to_local(remote_optim_path)
+                 optimizer_state_dict = torch.load(local_optim_path, weights_only=False)
+-                self.optimizer.load_state_dict(optimizer_state_dict)
++                try:
++                    self.optimizer.load_state_dict(optimizer_state_dict)
++                except ValueError as e:  # PATCHED (MAReasoning) 2026-09-24: FSDP1 optimizer shards do not map onto
++                    # FSDP2 param groups; keep the loaded weights and step counter, start Adam moments fresh.
++                    print(f"[PATCHED] optimizer state not loaded ({e}); continuing with a fresh optimizer state")
+                 log_with_rank(f"Loaded optimizer from {remote_optim_path}", rank=self.rank, logger=logger)
+ 
+         if self.should_load_extra:
+--- a/verl/model_merger/base_model_merger.py
++++ b/verl/model_merger/base_model_merger.py
+@@ -276,7 +276,7 @@
+         auto_model_class = self.get_transformers_auto_model_class()
+         with init_empty_weights():
+             model = auto_model_class.from_config(
+-                self.model_config, torch_dtype=torch.bfloat16, trust_remote_code=self.config.trust_remote_code
++                self.model_config, torch_dtype=getattr(torch, __import__("os").environ.get("MERGE_DTYPE", "bfloat16")),  # PATCHED (MAReasoning) 2026-09-28: allow fp32 export trust_remote_code=self.config.trust_remote_code
+             )
+         model.to_empty(device="cpu")
+         model = self.patch_model_generation_config(model)

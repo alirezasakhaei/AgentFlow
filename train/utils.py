@@ -1,139 +1,133 @@
-import re
-from pydantic import BaseModel
-from agentflow.engine.openai import ChatOpenAI
+"""Rule-based training reward. PATCHED (MAReasoning) 2026-09-23.
 
+Upstream used a gpt-4o LLM judge (needs OPENAI_API_KEY, non-deterministic, paid). This is the
+project's standing rule: no LLM judge, rule-based scoring only. Binary {0,1}, deterministic.
 
-class AnswerVerification(BaseModel):
-    analysis: str
-    true_false: bool
+  math   (source mathhard / aime2024 / math*): math_verify equivalence, then a numeric /
+         normalised-string fallback.
+  search (source nq / anything else): SQuAD-normalised exact match against any of the
+         "; "-separated golds, or the gold as a word-boundary substring of a SHORT answer
+         (<= max(8, 2*len(gold)+4) tokens) so hedging across many candidates is not rewarded.
+When source is unknown both checks run and either passing counts.
+"""
+import re, string, math
 
-try:
-    llm_scorer_engine = ChatOpenAI(
-        model_string="gpt-4o", 
-        is_multimodal=False, 
-        enable_cache=True
-    )
-    print(f"\nLLM Scorer engine '{llm_scorer_engine.model_string}' initialized successfully.\n")
-except Exception as e:
-    print(f"Failed to initialize LLM Scorer engine: {e}")
-    llm_scorer_engine = None
+MATH_SOURCES = ("mathhard", "aime", "math", "amc", "olympiad", "minerva", "gsm")
 
-def compute_score(question: str,  groundtruth: str, answer_extracted: str,) -> bool:
+def normalize(s: str) -> str:
+    s = str(s).lower()
+    s = "".join(ch for ch in s if ch not in set(string.punctuation))
+    s = re.sub(r"\b(a|an|the)\b", " ", s)
+    return " ".join(s.split())
+
+def _strip_math(s: str) -> str:
+    s = str(s).strip()
+    m = re.findall(r"\\boxed\{((?:[^{}]|\{[^{}]*\})*)\}", s)
+    if m: s = m[-1]
+    s = s.replace("$", "").replace("\\left", "").replace("\\right", "")
+    s = re.sub(r"\\text\{([^}]*)\}", r"\1", s)
+    s = s.replace("\\,", "").replace("\\!", "").replace("\\;", "").replace("\\ ", "")
+    s = s.replace("^\\circ", "").replace("^{\\circ}", "").replace("°", "")
+    s = s.replace("\\%", "").replace("%", "").replace(",", "")
+    s = re.sub(r"\\d?frac\{([^}]*)\}\{([^}]*)\}", r"(\1)/(\2)", s)
+    s = s.replace(" ", "").rstrip(".")
+    if s.startswith("{") and s.endswith("}"): s = s[1:-1]
+    return s
+
+def _num(s):
+    try:
+        if "/" in s and s.count("/") == 1:
+            a, b = s.replace("(", "").replace(")", "").split("/"); return float(a) / float(b)
+        return float(s)
+    except Exception:
+        return None
+
+def math_equal(pred: str, gold: str) -> bool:
+    pred, gold = str(pred), str(gold)
+    try:
+        from math_verify import parse, verify
+        g = parse(gold if "$" in gold or "\\boxed" in gold else f"${gold}$")
+        for cand in (pred, f"${pred}$"):
+            p = parse(cand)
+            if g and p and verify(g, p):
+                return True
+    except Exception:
+        pass
+    a, b = _strip_math(pred), _strip_math(gold)
+    if a and a == b:
+        return True
+    na, nb = _num(a), _num(b)
+    if na is not None and nb is not None:
+        return math.isclose(na, nb, rel_tol=1e-6, abs_tol=1e-9)
+    return False
+
+def search_correct(pred: str, gold: str) -> bool:
+    p = normalize(pred)
+    if not p:
+        return False
+    golds = [g for g in re.split(r"\s*;\s*", str(gold)) if g.strip()] or [str(gold)]
+    for g in golds:
+        ng = normalize(g)
+        if not ng:
+            continue
+        if p == ng:
+            return True
+        if re.search(r"(?<!\w)" + re.escape(ng) + r"(?!\w)", p) and \
+           len(p.split()) <= max(8, 2 * len(ng.split()) + 4):
+            return True
+    return False
+
+def rule_score(question: str, groundtruth: str, answer_extracted: str, source: str = None) -> bool:
+    """Rule-based verdict (math_verify / normalised EM); used directly when REWARD_MODE=rule,
+    and as the fallback when the judge is unreachable."""
+    src = (source or "").lower()
+    if any(k in src for k in MATH_SOURCES):
+        return math_equal(answer_extracted, groundtruth)
+    if src == "nq" or "search" in src or "wiki" in src or "hotpot" in src or "musique" in src:
+        return search_correct(answer_extracted, groundtruth)
+    return math_equal(answer_extracted, groundtruth) or search_correct(answer_extracted, groundtruth)
+
+def compute_score(question: str, groundtruth: str, answer_extracted: str, source: str = None) -> bool:
+    """Same signature as upstream (question, groundtruth, answer) plus the data source.
+
+    REWARD_MODE=judge (default): local Qwen3-30B-A3B judge (train/judge.py, AgentFlow's own rubric),
+    rule-based fallback if the judge fails. REWARD_MODE=rule: rule-based only. Both verdicts are
+    printed as a `[reward]` line so judge-vs-rule agreement can be measured from the rollout log.
     """
-    Uses gpt-4o to determine if the extracted answer matches the groundtruth.
-    
-    Args:
-        question: The full question text, including options.
-        answer_extracted: The answer provided by the model being evaluated.
-        groundtruth: The correct answer label (e.g., "A").
+    if answer_extracted is None or str(answer_extracted).strip() in ("", "None"):
+        return False
+    import os
+    mode = os.environ.get("REWARD_MODE", "judge").lower()
+    rule = rule_score(question, groundtruth, answer_extracted, source)
+    if mode == "rule":
+        return rule
+    from judge import judge
+    verdict, raw = judge(question, groundtruth, answer_extracted)
+    print(f"[reward] source={source} judge={verdict} rule={rule} gold={str(groundtruth)[:40]!r} answer={str(answer_extracted)[:60]!r}"
+          + (f" judge_raw={raw[:80]!r}" if verdict is None else ""))
+    return rule if verdict is None else verdict
 
-    Returns:
-        A boolean indicating whether the answer is correct.
-    """
-    if llm_scorer_engine is None:
-        raise RuntimeError("LLM Scorer engine is not available.")
+def _compute_score_rule_only(question, groundtruth, answer_extracted, source=None):
+    if answer_extracted is None or str(answer_extracted).strip() in ("", "None"):
+        return False
+    src = (source or "").lower()
+    if any(k in src for k in MATH_SOURCES):
+        return math_equal(answer_extracted, groundtruth)
+    if src == "nq" or "search" in src or "wiki" in src or "hotpot" in src or "musique" in src:
+        return search_correct(answer_extracted, groundtruth)
+    return math_equal(answer_extracted, groundtruth) or search_correct(answer_extracted, groundtruth)
 
-    query_prompt = f"""
-You are a precise evaluator. Determine if the Model Response is equivalent to the Ground Truth.
-
-**Instructions:**
-1.  **Extract:** Isolate the final answer from the Model Response, ignoring reasoning. Look for `\boxed{{...}}` or concluding statements.
-2.  **Normalize & Compare:** The extracted answer and Ground Truth must be equivalent after normalization:
-    - **Math:** Mathematically identical (e.g., `\\frac{{1}}{{2}}` == `0.5`).
-    - **Numbers/Text:** Ignore formatting, case, and currency/units (e.g., `1,000` == `1000`).
-    - **MCQ:** Match option content (e.g., "Paris") or number (e.g., `3rd` option) to the correct letter.
-3.  **Verdict:** "True" only for semantically or mathematically equivalent answers.
-
-**Inputs:**
-Question: {question}
-Model Response: {answer_extracted}
-Ground Truth: {groundtruth}
-
-**Format:**
-<analysis>: Brief analysis of the comparison.
-<true_false>: "True" or "False".
-"""
-
-    verification_result = llm_scorer_engine(query_prompt, response_format=AnswerVerification)
-    
-    return verification_result.true_false
-
-
-def eval(question: str, groundtruth: any, answer_extracted: any, val: bool = False) -> float:
-    """
-    Evaluates if the extracted answer is correct by calling an LLM judge (gpt-4o).
-    It strip(), and matches the final answer.
-    """
-    question_str = str(question)
-    groundtruth_str = str(groundtruth)
-    answer_extracted_str = str(answer_extracted)
-
-    is_correct = compute_score(question_str, answer_extracted_str, groundtruth_str)
-    
-    return 1.0 if is_correct else 0.0
-
-async def main():
-    # ==============================================================================
-    # ==============================================================================
-    print("--- Running Simple Case ---")
-    simple_question = "What is the capital of France?\nA) Berlin\nB) Madrid\nC) Paris\nD) Rome"
-    simple_groundtruth = "C"
-    simple_model_answer = "The correct answer is C."
-    score1 = eval(simple_question, simple_groundtruth, simple_model_answer)
-    print(f"Question: {simple_question}")
-    print(f"Model Answer: '{simple_model_answer}'")
-    print(f"Ground Truth: '{simple_groundtruth}'")
-    print(f"==> Score: {score1}\n") # 1.0
-
-    # ==============================================================================
-    # ==============================================================================
-    print("--- Running Case with LaTeX Formula ---")
-    latex_question = r"""
-Calculate the definite integral of $f(x) = 2x$ from $x=1$ to $x=3$.
-A) 4
-B) 6
-C) 8
-D) 10
-"""
-    latex_groundtruth = "C"
-    latex_model_answer = r"""
-To solve this, we need to compute the integral $\int_{1}^{3} 2x \,dx$.
-The antiderivative of $2x$ is $x^2$. 
-Using the Fundamental Theorem of Calculus, we evaluate this at the bounds:
-$F(b) - F(a) = 3^2 - 1^2 = 9 - 1 = 8$.
-"""
-    score2 = eval(latex_question, latex_groundtruth, latex_model_answer)
-    print(f"Question: {latex_question.strip()}")
-    print(f"Model Answer: '{latex_model_answer.strip()}'")
-    print(f"Ground Truth: '{latex_groundtruth}'")
-    print(f"==> Score: {score2}\n") # 1.0
-
-    # ==============================================================================
-    # ==============================================================================
-    print("--- Running Case with Multiple Intermediate Answers ---")
-    multi_answer_question = """
-A project has two phases. Phase 1 costs $5,000 and takes 3 months. Phase 2 costs $8,000 and takes 4 months. What is the total duration of the project?
-A) $13,000
-B) 4 months
-C) 7 months
-D) $5,000
-"""
-    multi_answer_groundtruth = "C"
-    multi_answer_model_response = """
-Let's analyze the problem.
-The cost of Phase 1 is $5,000 and the duration is 3 months.
-The cost of Phase 2 is $8,000 and the duration is 4 months.
-The total cost would be $5,000 + $8,000 = $13,000.
-The question asks for the total duration, which is 3 months + 4 months = 7 months.
-Therefore, the final answer is 7 months. This matches option C.
-"""
-    score3 = eval(multi_answer_question, multi_answer_groundtruth, multi_answer_model_response)
-    print(f"Question: {multi_answer_question.strip()}")
-    print(f"Model Answer: '{multi_answer_model_response.strip()}'")
-    print(f"Ground Truth: '{multi_answer_groundtruth}'")
-    print(f"==> Score: {score3}\n") # 1.0
-
+def eval(question, groundtruth, answer_extracted, val: bool = False, source: str = None) -> float:
+    return 1.0 if compute_score(str(question), str(groundtruth), str(answer_extracted), source) else 0.0
 
 if __name__ == "__main__":
-    import asyncio
-    asyncio.run(main())
+    tests = [("mathhard", "\\frac{1}{2}", "0.5", True), ("mathhard", "0.5", "\\boxed{\\frac{1}{2}}", True), ("mathhard", "\\sqrt{2}", "1.4142135", False),
+             ("mathhard", "42", "The answer is \\boxed{42}.", True),
+             ("mathhard", "42", "41", False),
+             ("nq", "James Madison; Madison", "james madison", True),
+             ("nq", "1999", "It was 1999", True),
+             ("nq", "Paris", "Paris, London, Berlin, Rome, Madrid, Lisbon, Vienna, Oslo, Bern", False),
+             ("nq", "no", "I do not know", False),
+             ("aime2024", "204", "204", True)]
+    for src, g, a, exp in tests:
+        got = rule_score("q", g, a, src); print("OK " if got == exp else "BAD", src, repr(g), repr(a), got)

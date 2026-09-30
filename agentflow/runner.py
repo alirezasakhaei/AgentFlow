@@ -114,6 +114,33 @@ class AgentRunner(ParallelWorkerBase):
         # Always extract triplets from the trace using TripletExporter
         if trace_spans:
             triplets = self.triplet_exporter.export(trace_spans)
+            # PATCHED (MAReasoning) 2026-09-23: the frozen helpers (planner_fixed / verifier /
+            # executor / tool engines) are served by a plain vLLM through the same openai client,
+            # so their calls also become openai.chat.completion spans, but without token ids.
+            # Upstream never saw this because its helpers went through DashScope/gpt-4o-mini.
+            # Keep only trainable-planner calls (the ones carrying token ids) and carry the
+            # terminal reward, which the matcher may have pinned to a helper call, over to the
+            # last kept triplet; otherwise final_reward is None and the daemon fills it with 0.
+            if triplets:
+                seen_rewards = [t.reward for t in triplets if t.reward is not None]
+                kept = [t for t in triplets if t.prompt.get("token_ids") and t.response.get("token_ids")]
+                if seen_rewards and kept and kept[-1].reward is None:
+                    kept[-1] = kept[-1].model_copy(update={"reward": seen_rewards[-1]})
+                if len(kept) != len(triplets):
+                    logger.info(f"[Triplets] kept {len(kept)}/{len(triplets)} LLM calls with token ids (helper calls dropped)")
+                triplets = kept
+                # PATCHED (MAReasoning) 2026-09-30: overlong penalty (DAPO-style). Run 2 (lr 1e-5) collapsed
+                # into repetition loops that filled the 2048-token response budget while the judge kept
+                # paying for answers the frozen executor produced anyway. A planner turn that hits the
+                # budget is a format failure: zero the terminal reward of the whole rollout.
+                _cap = int(os.environ.get("AGENTFLOW_MAX_RESPONSE_TOKENS", "0") or 0)
+                if _cap and kept:
+                    _lens = [len(t.response.get("token_ids") or ()) for t in kept]
+                    if max(_lens) >= _cap:
+                        logger.info(f"[Penalty] planner response hit the {_cap}-token cap (lens={_lens}); reward -> 0")
+                        kept = [t.model_copy(update={"reward": 0.0}) if t.reward is not None else t for t in kept]
+                        triplets = kept
+                        final_reward = 0.0
 
         # If the agent has triplets, use the last one for final reward if not set
         if triplets and triplets[-1].reward is not None and final_reward is None:

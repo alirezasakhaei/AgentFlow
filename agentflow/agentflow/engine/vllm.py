@@ -1,9 +1,8 @@
 # Reference: https://github.com/zou-group/textgrad/blob/main/textgrad/engine/openai.py
 
-try:
-    import vllm
-except ImportError:
-    raise ImportError("If you'd like to use VLLM models, please install the vllm package by running `pip install vllm`.")
+# PATCHED (MAReasoning) 2026-09-25: this engine is a plain OpenAI-compatible HTTP client; it never
+# used the vllm package, yet importing it pulled torch/CUDA into every rollout worker (32 workers
+# were holding ~215 GB of host RAM and Ray killed the trainer at the node memory threshold).
 
 try:
     from openai import OpenAI
@@ -64,6 +63,15 @@ class ChatVLLM(EngineLM, CachedEngine):
         except Exception as e:
             raise ValueError(f"Failed to connect to VLLM server at {self.base_url}. Please ensure the server is running and try again.")
 
+    def _extra_body(self):
+        """PATCHED (MAReasoning): hybrid-reasoning Qwen3/Qwen3.5 think by default, which blows the
+        2048-token response budget and changes the planner's output format. AGENTFLOW_DISABLE_THINKING=1
+        (default when the model name contains "qwen3") passes enable_thinking=False through the
+        chat template on every request, planner and helpers alike, so both arms see the same mode."""
+        flag = os.environ.get("AGENTFLOW_DISABLE_THINKING")
+        off = (flag == "1") if flag is not None else ("qwen3" in self.model_string.lower())
+        return {"chat_template_kwargs": {"enable_thinking": False}} if off else None
+
     @retry(wait=wait_random_exponential(min=1, max=3), stop=stop_after_attempt(3))
     def generate(self, content: Union[str, List[Union[str, bytes]]], system_prompt=None, **kwargs):
         try:
@@ -116,12 +124,13 @@ class ChatVLLM(EngineLM, CachedEngine):
                 {"role": "system", "content": sys_prompt_arg},
                 {"role": "user", "content": prompt},
             ],
-            frequency_penalty=kwargs.get("frequency_penalty", 1.2),
+            frequency_penalty=kwargs.get("frequency_penalty", 0.0),  # PATCHED (MAReasoning): 1.2 drives 7B models off-distribution (CJK drift, boxed-spam).
             presence_penalty=0,
             stop=None,
             temperature=kwargs.get("temperature", 0.7),
             max_tokens=max_tokens,
             top_p=top_p,
+            extra_body=self._extra_body(),  # PATCHED (MAReasoning)
         )
         response = response.choices[0].message.content
 
@@ -174,6 +183,7 @@ class ChatVLLM(EngineLM, CachedEngine):
             temperature=temperature,
             max_tokens=max_tokens,
             top_p=top_p,
+            extra_body=self._extra_body(),  # PATCHED (MAReasoning)
         )
         response_text = response.choices[0].message.content
 

@@ -5,7 +5,10 @@ from pydantic import BaseModel
 
 from agentflow.tools.base import BaseTool
 from agentflow.engine.factory import create_llm_engine
-from agentflow.tools.web_search.tool import Web_Search_Tool
+# PATCHED (MAReasoning): module-scope import removed. Initializer._load_single_tool
+# registers every *Tool class in a module, so importing Web_Search_Tool here injected
+# Web_RAG_Search_Tool (paid OpenAI embeddings) into the toolbox even when only
+# Wikipedia_Search_Tool was enabled. Imported inside execute() instead.
 
 # from web_rag import Web_Search_Tool
 # from agentflow.tools.web_search.tool import Web_Search_Tool # NOTE: Shall be used in the future
@@ -14,6 +17,21 @@ from agentflow.tools.web_search.tool import Web_Search_Tool
 
 from agentflow.tools.base import BaseTool
 from agentflow.engine.factory import create_llm_engine
+
+# PATCHED (MAReasoning): Wikimedia now 403s the wikipedia package's stock user-agent
+# ("Please set a user-agent and respect our robot policy", phab T400119), which surfaced
+# as JSONDecodeError on every page()/summary() call while search() kept working. Set a
+# descriptive UA and use https. Project-only UA, no personal contact.
+import wikipedia.wikipedia as _wp
+_wp.API_URL = "https://en.wikipedia.org/w/api.php"
+wikipedia.set_user_agent("MAReasoning-eval/0.1 (EPFL NLP research)")
+# PATCHED (MAReasoning): Wikimedia's robot policy asks for serialised requests. Without
+# this, concurrent solve.py workers burst enough requests to get non-JSON throttle
+# responses back, which surfaced as "Error searching Wikipedia: Expecting value:
+# line 1 column 1" on ~60% of calls and silently pushed the planner onto its parametric
+# fallback instead of retrieval.
+from datetime import timedelta as _timedelta
+wikipedia.set_rate_limiting(True, min_wait=_timedelta(milliseconds=300))
 
 # Tool name mapping - this defines the external name for this tool
 TOOL_NAME = "Wikipedia_RAG_Search_Tool"
@@ -106,8 +124,47 @@ Output:
         response = llm_engine.generate(prompt, response_format=Select_Relevant_Queries)
         # print(response)
 
-        matched_queries = response.matched_queries
-        matched_query_ids = [int(i) for i in response.matched_query_ids]
+        # PATCHED (MAReasoning): the vLLM engine accepts response_format but ignores it
+        # (engine/vllm.py::_generate_text -> "Chat models without structured outputs"), so
+        # `response` is a plain string here and the upstream attribute access raised
+        # "'str' object has no attribute 'matched_queries'". That exception was caught
+        # below and turned into ([], []), i.e. zero relevant pages -> the tool silently
+        # returned nothing but titles. Parse the text format the prompt already asks for,
+        # and still accept a real pydantic object if a structured engine is used.
+        if hasattr(response, "matched_queries"):
+            matched_queries = list(response.matched_queries)
+            matched_query_ids = [int(i) for i in response.matched_query_ids]
+        else:
+            import re as _re
+            text = str(response)
+            n_candidates = len(query_candidates.strip().split("\n"))
+            ids_match = _re.search(
+                r"Matched\s+Query\s+IDs?\s*:?\s*\**\s*\[?([0-9,\s]+)\]?", text, _re.I
+            )
+            matched_query_ids = []
+            if ids_match:
+                matched_query_ids = [
+                    int(tok) for tok in _re.findall(r"\d+", ids_match.group(1))
+                ]
+            q_match = _re.search(r"Matched\s+Queries\s*:?\s*\**\s*(.+)", text, _re.I)
+            matched_queries = (
+                [s.strip() for s in q_match.group(1).split(",") if s.strip()]
+                if q_match else []
+            )
+            # Fall back to the top search hit rather than returning nothing at all:
+            # an empty list here is indistinguishable from "Wikipedia had no answer",
+            # which is exactly the silent failure this patch exists to remove.
+            if not matched_query_ids:
+                print(
+                    "[Wikipedia RAG Search] PATCHED (MAReasoning): could not parse "
+                    f"matched query ids from engine output; falling back to top hit. "
+                    f"Raw head: {text[:160]!r}"
+                )
+                matched_query_ids = [0]
+            # Guard against hallucinated out-of-range ids (upstream would IndexError).
+            matched_query_ids = sorted(
+                {i for i in matched_query_ids if 0 <= i < n_candidates}
+            )[:3]
         return matched_queries, matched_query_ids
     except Exception as e:
         print(f"Error selecting relevant queries: {e}")
@@ -142,6 +199,10 @@ class Wikipedia_Search_Tool(BaseTool):
                 "best_practice": BEST_PRACTICE
             }
         )
+        # PATCHED (MAReasoning): BaseTool.__init__ was called without model_string, so
+        # self.model_string stayed None and the Web-RAG handoff in execute() failed
+        # silently (bare except -> empty relevant_pages). Set it explicitly.
+        self.model_string = model_string
         self.llm_engine = create_llm_engine(model_string=model_string, temperature=0.0, top_p=1.0, frequency_penalty=0.0, presence_penalty=0.0)
 
     def _get_wikipedia_url(self, query):
@@ -151,52 +212,42 @@ class Wikipedia_Search_Tool(BaseTool):
         query = query.replace(" ", "_") # replace spaces with underscores
         return f"https://en.wikipedia.org/wiki/{query}"
 
-    def search_wikipedia(self, query, max_length=100, max_pages=10):
+    def search_wikipedia(self, query, max_length=100, max_pages=10, retries=3):
         """
-        Searches Wikipedia based on the given query and returns multiple pages with their text and URLs.
+        Search Wikipedia and return candidate pages as {title, url, abstract}.
 
-        Parameters:
-            query (str): The search query for Wikipedia.
-
-        Returns:
-            tuple: (search_results, pages_data)
-                - search_results: List of search result titles
-                - pages_data: List of dictionaries containing page info (title, text, url, error)
+        PATCHED (MAReasoning): upstream called wikipedia.page(title) for all max_pages=10
+        hits to populate `abstract`, i.e. ~20-30 HTTP requests per single tool call. That
+        work was wasted twice over: select_relevant_queries() is handed titles only (never
+        abstracts), and the Web-RAG step re-fetches the chosen page from its URL anyway.
+        The amplification is what triggered Wikimedia throttling under concurrent workers.
+        Now: one search request, URLs derived from titles, and page bodies fetched only for
+        the pages the selector actually picks. Search is retried with backoff, and a
+        throttle/transport failure is reported as an explicit error instead of an empty list.
         """
-        try:
-            search_results = wikipedia.search(query)
-            if not search_results:
-                return [{"title": None, "url": None, "abstract": None, "error": f"No results found for query: {query}"}]
-
-            pages_data = []
-            pages_to_process = search_results[:max_pages] if max_pages else search_results
-
-            # get the pages datafsave
-            
-            for title in pages_to_process:
-                try:
-                    page = wikipedia.page(title)
-                    text = page.content
-                    url = page.url
-
-                    if max_length != -1:
-                        text = text[:max_length] + f"... [truncated]" if len(text) > max_length else text
-
-                    pages_data.append({
-                        "title": title,
-                        "url": url,
-                        "abstract": text
-                    })
-                except Exception as e:
-                    pages_data.append({
+        import time as _time
+        last_err = None
+        for attempt in range(retries):
+            try:
+                search_results = wikipedia.search(query)
+                if not search_results:
+                    return [{"title": None, "url": None, "abstract": None,
+                             "error": f"No results found for query: {query}"}]
+                pages_to_process = search_results[:max_pages] if max_pages else search_results
+                return [
+                    {
                         "title": title,
                         "url": self._get_wikipedia_url(title),
-                        "abstract": "Please use the URL to get the full text further if needed.",
-                    })
-
-            return pages_data
-        except Exception as e:
-            return [{"title": None, "url": None, "abstract": None, "error": f"Error searching Wikipedia: {str(e)}"}]
+                        "abstract": "Not fetched yet; retrieved_information is filled in for selected pages.",
+                    }
+                    for title in pages_to_process
+                ]
+            except Exception as e:
+                last_err = e
+                if attempt < retries - 1:
+                    _time.sleep(1.5 * (2 ** attempt))
+        return [{"title": None, "url": None, "abstract": None,
+                 "error": f"Error searching Wikipedia after {retries} attempts: {str(last_err)}"}]
 
     def execute(self, query):
         """
@@ -208,10 +259,10 @@ class Wikipedia_Search_Tool(BaseTool):
         Returns:
             dict: A dictionary containing the search results and all matching pages with their content.
         """
-        # Check if OpenAI API key is set
-        api_key = os.getenv("OPENAI_API_KEY")
-        if not api_key:
-            sys.exit("[Wikipedia RAG Search] Error: OPENAI_API_KEY environment variable is not set.")
+        # PATCHED (MAReasoning): upstream did a hard sys.exit() here when OPENAI_API_KEY
+        # was unset, killing the whole solve.py worker rather than degrading. Wikipedia
+        # search and page fetch need no key, and the downstream embedding step is now
+        # local (see web_search/tool.py::_embed_strings). Gate removed.
             
         # First get relevant queries from the search results
         search_results = self.search_wikipedia(query)
@@ -230,6 +281,7 @@ class Wikipedia_Search_Tool(BaseTool):
 
         # For each relevant page, get detailed information using Web RAG
         try:
+            from agentflow.tools.web_search.tool import Web_Search_Tool  # PATCHED (MAReasoning): lazy, see header
             web_rag_tool = Web_Search_Tool(model_string=self.model_string)
         except Exception as e:
             print(f"Error creating Web RAG tool: {e}")
