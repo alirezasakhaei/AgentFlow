@@ -21,19 +21,19 @@ ENV PATH=/opt/venv/bin:$PATH VIRTUAL_ENV=/opt/venv
 COPY docker/requirements.lock /tmp/requirements.lock
 RUN --mount=type=cache,target=/root/.cache/uv \
     uv pip install --python /opt/venv -r /tmp/requirements.lock \
-      --extra-index-url https://download.pytorch.org/whl/cu128 --index-strategy unsafe-best-match
+      --extra-index-url https://download.pytorch.org/whl/cu128 --index-strategy unsafe-best-match     && chmod -R a+rwX /opt/venv /opt/python
 # 2) verl fixes (prefix-caching switch, FSDP1->FSDP2 optimizer resume, MERGE_DTYPE)
 COPY docker/verl-0.5.0-mareasoning.patch /tmp/verl.patch
-RUN cd /opt/venv/lib/python3.12/site-packages && patch -p1 --forward < /tmp/verl.patch \
+RUN cd /opt/venv/lib/python3.12/site-packages && patch -p1 --forward < /tmp/verl.patch && chmod -R a+rwX verl \
     && grep -l "PATCHED (MAReasoning)" verl/workers/rollout/vllm_rollout/vllm_async_server.py verl/utils/checkpoint/fsdp_checkpoint_manager.py verl/model_merger/base_model_merger.py | wc -l | grep -q 3
 # 3) the code (fork with PATCHED (MAReasoning) edits), editable so a bind-mount of a newer checkout also works
 WORKDIR /workspace/AgentFlow
 COPY . /workspace/AgentFlow
-RUN uv pip install --python /opt/venv --no-deps -e /workspace/AgentFlow -e /workspace/AgentFlow/agentflow
+RUN uv pip install --python /opt/venv --no-deps -e /workspace/AgentFlow -e /workspace/AgentFlow/agentflow     && chmod -R a+rwX /opt/venv/lib/python3.12/site-packages/*.pth /opt/venv/lib/python3.12/site-packages/__editable__* /opt/venv/lib/python3.12/site-packages/agentflow* 2>/dev/null || true
 # 4) any-uid friendliness + defaults. Data, HF cache, checkpoints and run logs are volumes (see README).
 ENV HOME=/workspace/home PYTHONPATH=/workspace/AgentFlow PYTHONUNBUFFERED=1 VLLM_USE_V1=1 \
     HF_HOME=/data/hf AF_RUNS=/data/runs TOKENIZERS_PARALLELISM=false
-RUN mkdir -p /workspace/home /data/hf /data/runs /data/ckpt && chmod -R a+rwX /workspace /opt/venv /data \
+RUN mkdir -p /workspace/home /data/hf /data/runs /data/ckpt && chmod -R a+rwX /workspace /data \
     && chmod +x /workspace/AgentFlow/docker/entrypoint.sh
 ARG GIT_SHA=unknown
 LABEL org.opencontainers.image.title="agentflow-train" org.opencontainers.image.revision=$GIT_SHA \
