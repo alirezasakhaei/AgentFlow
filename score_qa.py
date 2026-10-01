@@ -92,6 +92,7 @@ def main():
             continue
         n += 1
         gold_list = golds[pid] if isinstance(golds[pid], list) else [golds[pid]]
+        gold_list = [str(g) for g in gold_list]  # PATCHED (MAReasoning) 2026-10-01: AIME golds are ints in data.json
         pred = extract_prediction(d.get("direct_output", ""))
         if not pred:
             empty.append(pid)
@@ -139,7 +140,7 @@ def main():
         print("first tool chosen per item:")
         for t, c in step1_tool.most_common():
             print(f"   {c:5d}  {t}")
-        wiki = sum(c for t, c in tool_counter.items() if "Wikipedia" in t)
+        wiki = sum(c for t, c in tool_counter.items() if t and "Wikipedia" in t)
         print(f"\nitems whose FIRST tool was Wikipedia: {step1_tool.get('Wikipedia_RAG_Search_Tool', 0)}/{n}")
         print(f"total Wikipedia tool calls          : {wiki}")
 
